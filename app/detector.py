@@ -132,21 +132,21 @@ class RtspPublisher:
     #                     we don't have to manage PTS manually.
     # format=time     – required for do-timestamp to work correctly.
     _PIPELINE_HW = (
-        "appsrc name=src is-live=true do-timestamp=true block=false format=time "
+        "appsrc name=src is-live=true do-timestamp=true block=false format=time max-bytes=1 "
         "caps=video/x-raw,format=BGR,width={w},height={h},framerate={fps}/1 "
         "! videoconvert "
         "! video/x-raw,format=I420 "
-        "! nvv4l2h264enc maxperf-enable=1 bitrate=4000000 iframeinterval=30 "
+        "! nvv4l2h264enc maxperf-enable=1 bitrate=4000000 iframeinterval=5 "
         "! h264parse "
         "! rtph264pay name=pay0 pt=96 config-interval=-1"
     )
 
     _PIPELINE_SW = (
-        "appsrc name=src is-live=true do-timestamp=true block=false format=time "
+        "appsrc name=src is-live=true do-timestamp=true block=false format=time max-bytes=1 "
         "caps=video/x-raw,format=BGR,width={w},height={h},framerate={fps}/1 "
         "! videoconvert "
         "! video/x-raw,format=I420 "
-        "! x264enc tune=zerolatency bitrate=4000 speed-preset=ultrafast key-int-max=30 "
+        "! x264enc tune=zerolatency bitrate=4000 speed-preset=ultrafast key-int-max=5 "
         "! h264parse "
         "! rtph264pay name=pay0 pt=96 config-interval=-1"
     )
