@@ -126,8 +126,13 @@ class RtspPublisher:
     # clients decode within one GOP.
     # config-interval=-1 → SPS/PPS resent before every IDR so clients that
     # connect mid-stream don't wait for the next in-band parameter set.
+    # is-live=true    – required for GstRtspServer; the server drives liveness
+    #                   and need-data fires correctly during preroll.
+    # do-timestamp=true – appsrc stamps each buffer with the pipeline clock so
+    #                     we don't have to manage PTS manually.
+    # format=time     – required for do-timestamp to work correctly.
     _PIPELINE_HW = (
-        "appsrc name=src is-live=true block=false format=time "
+        "appsrc name=src is-live=true do-timestamp=true block=false format=time "
         "caps=video/x-raw,format=BGR,width={w},height={h},framerate={fps}/1 "
         "! videoconvert "
         "! video/x-raw,format=I420 "
@@ -137,7 +142,7 @@ class RtspPublisher:
     )
 
     _PIPELINE_SW = (
-        "appsrc name=src is-live=true block=false format=time "
+        "appsrc name=src is-live=true do-timestamp=true block=false format=time "
         "caps=video/x-raw,format=BGR,width={w},height={h},framerate={fps}/1 "
         "! videoconvert "
         "! video/x-raw,format=I420 "
@@ -160,10 +165,9 @@ class RtspPublisher:
         self.height = height
         self.fps    = fps
 
-        self._frame_duration: int = 0       # ns per frame, set in start()
-        self._stream_start: Optional[float] = None  # wall-clock origin, ns
+        self._frame_duration: int = 0              # ns per frame, set in start()
         self._lock = threading.Lock()
-        self._latest_frame: Optional[bytes] = None  # most recent BGR tobytes()
+        self._latest_frame: Optional[bytes] = None # most recent BGR tobytes()
         self._started = False
 
         if not _GST_RTSP_AVAILABLE:
@@ -218,55 +222,30 @@ class RtspPublisher:
                     [e.get_name() for e in element.iterate_elements()])
                 return
 
-            with self._lock:
-                self._stream_start = None
-
             appsrc.connect("need-data", self._on_need_data, appsrc)
 
-            # Forward any GStreamer bus errors to the Python logger so they
-            # appear in the application logs instead of being swallowed silently.
+            # Forward GStreamer bus errors to the Python logger.
             bus = element.get_bus()
             if bus:
                 bus.add_signal_watch()
                 bus.connect("message::error",   self._on_bus_error)
                 bus.connect("message::warning",  self._on_bus_warning)
-                bus.connect("message::state-changed", self._on_bus_state)
 
-            logger.info("RTSP session configured; pipeline: %s",
-                        element.get_name())
+            logger.info("RTSP session configured; pipeline: %s", element.get_name())
         except Exception:
             logger.exception("RTSP _on_media_configure failed")
-
-    def _on_bus_error(self, bus, message) -> None:  # noqa: ARG002
-        err, dbg = message.parse_error()
-        logger.error("GStreamer pipeline ERROR: %s | %s", err, dbg)
-
-    def _on_bus_warning(self, bus, message) -> None:  # noqa: ARG002
-        warn, dbg = message.parse_warning()
-        logger.warning("GStreamer pipeline WARNING: %s | %s", warn, dbg)
-
-    def _on_bus_state(self, bus, message) -> None:  # noqa: ARG002
-        old, new, pending = message.parse_state_changed()
-        src = message.src.get_name() if message.src else "?"
-        logger.debug("GStreamer state: %s  %s→%s (pending: %s)",
-                     src, old.value_nick, new.value_nick, pending.value_nick)
 
     def _on_need_data(self, _src, _length, appsrc) -> None:
         """Called by GStreamer on the GLib thread each time a buffer is needed.
 
-        Must always push exactly one buffer (or EOS) — returning without
-        pushing causes appsrc to stall and never call need-data again.
+        do-timestamp=true on appsrc means GStreamer stamps each buffer with the
+        pipeline clock automatically — we never touch buf.pts.
         If no frame is available yet we push a GAP buffer so the pipeline
-        clock keeps ticking.
+        clock keeps ticking and need-data fires again.
         """
         try:
-            now = time.monotonic()
-
             with self._lock:
                 data = self._latest_frame
-                if self._stream_start is None:
-                    self._stream_start = now
-                pts = int((now - self._stream_start) * 1e9)
 
             if data is not None:
                 buf = Gst.Buffer.new_wrapped(data)
@@ -275,13 +254,20 @@ class RtspPublisher:
                 buf = Gst.Buffer.new_allocate(None, self.width * self.height * 3, None)
                 buf.add_flags(Gst.BufferFlags.GAP)
 
-            buf.pts      = pts
             buf.duration = self._frame_duration
             ret = appsrc.emit("push-buffer", buf)
             if ret != Gst.FlowReturn.OK:
                 logger.warning("appsrc push-buffer returned: %s", ret)
         except Exception:
             logger.exception("RTSP _on_need_data failed")
+
+    def _on_bus_error(self, bus, message) -> None:  # noqa: ARG002
+        err, dbg = message.parse_error()
+        logger.error("GStreamer pipeline ERROR: %s | %s", err, dbg)
+
+    def _on_bus_warning(self, bus, message) -> None:  # noqa: ARG002
+        warn, dbg = message.parse_warning()
+        logger.warning("GStreamer pipeline WARNING: %s | %s", warn, dbg)
 
     def push_frame(self, frame: np.ndarray) -> None:
         """Store the latest annotated frame so need-data can deliver it."""
