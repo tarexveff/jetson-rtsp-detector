@@ -69,7 +69,6 @@ RUN pip3 install --no-cache-dir \
 
 # ── application code ───────────────────────────────────────────────────────────
 WORKDIR /app
-COPY app/ /app/
 
 # Model weights are downloaded on first run and cached in /models.
 # Mount a host volume here to avoid re-downloading across container restarts:
@@ -96,3 +95,5 @@ EXPOSE 8080
 EXPOSE 8554
 
 CMD ["python3", "main.py"]
+
+COPY app/ /app/
