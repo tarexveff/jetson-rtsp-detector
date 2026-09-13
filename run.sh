@@ -38,9 +38,6 @@ MODEL_SIZE="${MODEL_SIZE:-n}"
 WEB_PORT="${WEB_PORT:-8080}"
 RTSP_OUT_PORT="${RTSP_OUT_PORT:-8554}"
 RTSP_OUT_PATH="${RTSP_OUT_PATH:-/live}"
-# UDP_DEST: IP address of the machine that will play the stream.
-# Change this to the IP of your viewing machine, e.g. 192.168.1.50
-UDP_DEST="${UDP_DEST:-127.0.0.1}"
 USE_TENSORRT="${USE_TENSORRT:-0}"
 IMAGE_NAME="${IMAGE_NAME:-rtsp-detector}"
 MODEL_CACHE_DIR="${MODEL_CACHE_DIR:-$(pwd)/models}"
@@ -71,29 +68,32 @@ podman build \
 # ── resolve video group ID so the container can access /dev/videoN ───────────
 VIDEO_GID=$(getent group video 2>/dev/null | cut -d: -f3 || stat -c '%g' "${CAMERA_DEVICE}" 2>/dev/null || echo "")
 
-# ── mount host Jetson CUDA/tegra libraries ───────────────────────────────────
-# Strategy: mount the tegra dir to a NEUTRAL path (/host-tegra) so it never
-# shadows the container's own /usr/lib/aarch64-linux-gnu/gstreamer-1.0 dir.
-# Then set LD_LIBRARY_PATH to include /host-tegra so PyTorch finds libcuda.so.
-# The Jetson GStreamer NV plugins are mounted to a separate subdir and added
-# to GST_PLUGIN_PATH so nvv4l2h264enc etc. load from the real host .so files.
+# ── mount host Jetson CUDA/tegra userspace libraries ─────────────────────────
+# On Jetson the CUDA runtime is NOT inside the container image — it lives on
+# the host BSP.  We bind-mount the relevant host paths so the container's
+# PyTorch/CUDA can find libcuda.so, libnvrtc.so, etc.
+# Paths that don't exist on this host are simply skipped.
 CUDA_MOUNTS=()
-
-# Tegra runtime libs → neutral mount point (no collision with container paths)
-if [[ -d /usr/lib/aarch64-linux-gnu/tegra ]]; then
-  CUDA_MOUNTS+=("--volume" "/usr/lib/aarch64-linux-gnu/tegra:/host-tegra:ro")
-  echo "   tegra libs  : mounted → /host-tegra"
-fi
-if [[ -d /usr/lib/aarch64-linux-gnu/tegra-egl ]]; then
-  CUDA_MOUNTS+=("--volume" "/usr/lib/aarch64-linux-gnu/tegra-egl:/host-tegra-egl:ro")
-fi
-
-# CUDA toolkit dirs (safe to mount at their original paths — no plugin clash)
-for lib_path in /usr/local/cuda /usr/local/cuda-12 /usr/local/cuda-12.8 /usr/lib64/nvidia; do
-  [[ -d "$lib_path" ]] && CUDA_MOUNTS+=("--volume" "${lib_path}:${lib_path}:ro")
+for lib_path in \
+    /usr/lib/aarch64-linux-gnu/tegra \
+    /usr/lib/aarch64-linux-gnu/tegra-egl \
+    /usr/lib64/nvidia \
+    /usr/local/cuda \
+    /usr/local/cuda-12 \
+    /usr/local/cuda-12.8 \
+; do
+  [[ -e "$lib_path" ]] && CUDA_MOUNTS+=("--volume" "${lib_path}:${lib_path}:ro")
 done
 
-echo "   CUDA mounts : ${#CUDA_MOUNTS[@]} total"
+# libcuda.so is sometimes a standalone file outside the tegra dir
+for lib_file in \
+    /usr/lib/aarch64-linux-gnu/libcuda.so.1 \
+    /usr/lib/aarch64-linux-gnu/libcuda.so \
+; do
+  [[ -e "$lib_file" ]] && CUDA_MOUNTS+=("--volume" "${lib_file}:${lib_file}:ro")
+done
+
+echo "   CUDA mounts : ${#CUDA_MOUNTS[@]} paths mounted from host"
 
 # ── stop any existing instance ────────────────────────────────────────────────
 podman rm -f "${CONTAINER_NAME}" 2>/dev/null || true
@@ -137,17 +137,16 @@ podman run \
   --env RTSP_OUT_PORT="${RTSP_OUT_PORT}" \
   --env RTSP_OUT_PATH="${RTSP_OUT_PATH}" \
   --env USE_TENSORRT="${USE_TENSORRT}" \
-  --env UDP_DEST="${UDP_DEST}" \
-  --env LD_LIBRARY_PATH="/host-tegra:/host-tegra-egl:/usr/lib64/nvidia:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}" \
+  --env LD_LIBRARY_PATH="/usr/lib/aarch64-linux-gnu/tegra:/usr/lib64/nvidia:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}" \
   \
   "${IMAGE_NAME}:latest"
 
 echo ""
 echo "✓ Container started."
 echo ""
-echo "  UDP stream  : udp://@:${RTSP_OUT_PORT}"
-echo "              Play with:  ffplay \"udp://@:${RTSP_OUT_PORT}?overrun_nonfatal=1&fifo_size=50000000\""
-echo "              Or:         vlc    udp://@:${RTSP_OUT_PORT}"
+echo "  RTSP stream : rtsp://${HOST_IP}:${RTSP_OUT_PORT}${RTSP_OUT_PATH}"
+echo "              Play with:  ffplay rtsp://${HOST_IP}:${RTSP_OUT_PORT}${RTSP_OUT_PATH}"
+echo "              Or:         vlc    rtsp://${HOST_IP}:${RTSP_OUT_PORT}${RTSP_OUT_PATH}"
 echo ""
 echo "  Web preview : http://${HOST_IP}:${WEB_PORT}"
 echo ""

@@ -232,9 +232,9 @@
       </div>
     </div>
 
-    <!-- UDP stream output -->
+    <!-- RTSP output -->
     <div class="card">
-      <h2>Video Stream Output</h2>
+      <h2>RTSP Output</h2>
       <div class="stat-row" style="flex-direction:column;align-items:flex-start;gap:0.3rem">
         <span class="stat-label">Stream URL</span>
         <span class="stat-value accent"
@@ -245,8 +245,8 @@
       </div>
       <div style="margin-top:0.6rem;font-size:0.75rem;color:#6b7280;line-height:1.5">
         Play with:<br>
-        <code style="color:#a5b4fc">ffplay "{{ rtsp_output_url }}?overrun_nonfatal=1"</code><br>
-        <code style="color:#a5b4fc">vlc {{ rtsp_output_url }}</code>
+        <code style="color:#a5b4fc">vlc {{ rtsp_output_url }}</code><br>
+        <code style="color:#a5b4fc">ffplay {{ rtsp_output_url }}</code>
       </div>
     </div>
 

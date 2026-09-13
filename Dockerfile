@@ -54,8 +54,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         v4l-utils \
         ffmpeg \
         curl \
-    && rm -rf /var/lib/apt/lists/* \
-    && rm -f /usr/lib/aarch64-linux-gnu/gstreamer-1.0/libgstnv*.so
+    && rm -rf /var/lib/apt/lists/*
 
 # ── Python dependencies ────────────────────────────────────────────────────────
 # The dustynv base image uses a venv at /opt/venv — pip3 points into it.

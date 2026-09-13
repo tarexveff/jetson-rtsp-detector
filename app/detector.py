@@ -24,17 +24,17 @@ import cv2
 import numpy as np
 from ultralytics import YOLO
 
-
-# gi/GStreamer is used directly for the UDP output pipeline since OpenCV
-# in the dustynv base image is built without GStreamer write support.
+# GStreamer Python bindings (gi) are used only for the RTSP server.
+# If unavailable the RTSP output falls back to a raw UDP/RTP appsrc pipeline.
 try:
     import gi
     gi.require_version("Gst", "1.0")
+    gi.require_version("GstRtspServer", "1.0")
     gi.require_version("GLib", "2.0")
-    from gi.repository import Gst, GLib
-    _GST_AVAILABLE = True
+    from gi.repository import Gst, GstRtspServer, GLib
+    _GST_RTSP_AVAILABLE = True
 except Exception:
-    _GST_AVAILABLE = False
+    _GST_RTSP_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -91,149 +91,163 @@ def _draw_boxes(frame: np.ndarray, results) -> np.ndarray:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# RTP/UDP publisher — uses gi/GStreamer directly (OpenCV has no GStreamer write)
+# RTSP publisher
 # ══════════════════════════════════════════════════════════════════════════════
 
 class RtspPublisher:
     """
-    Encodes annotated frames as H.264 and sends them as RTP over UDP using
-    a GStreamer pipeline driven directly via Python gi bindings.
+    Wraps a GStreamer RTSP server that streams annotated frames pushed by
+    the detector thread.
 
-    Pipeline:
-      appsrc → videoconvert → x264enc → h264parse → rtph264pay → udpsink
+    Clients connect to:  rtsp://<host>:<rtsp_port>/<rtsp_path>
 
-    OpenCV in the dustynv/pytorch image is built WITHOUT GStreamer write
-    support, so cv2.VideoWriter cannot be used here.  Instead we build the
-    pipeline with Gst.parse_launch, grab the appsrc element, and push raw
-    BGR frames as GstBuffers from push_frame().
+    Implementation notes
+    ────────────────────
+    GstRtspServer works by mounting a "media factory" at a URL path.  We use
+    an appsrc-based factory so we can push raw BGR frames from Python.  Each
+    frame is converted to I420 and encoded to H.264 by nvv4l2h264enc (Jetson
+    HW encoder) with a software x264enc fallback.
 
-    Clients play with:
-      ffplay udp://@:<port>?overrun_nonfatal=1&fifo_size=50000000
-      vlc    udp://@:<port>
+    The GLib main loop must run in its own thread so that GStreamer can
+    dispatch its internal callbacks.
     """
+
+    # Pipeline launched inside the RTSP session for each connecting client.
+    # appsrc feeds BGR → videoconvert → I420 → HW H.264 encode → RTP packetise.
+    _PIPELINE_HW = (
+        "appsrc name=src is-live=true block=false format=time "
+        "caps=video/x-raw,format=BGR,width={w},height={h},framerate={fps}/1 "
+        "! videoconvert "
+        "! video/x-raw,format=I420 "
+        "! nvv4l2h264enc maxperf-enable=1 bitrate=4000000 "
+        "! h264parse "
+        "! rtph264pay name=pay0 pt=96"
+    )
+
+    _PIPELINE_SW = (
+        "appsrc name=src is-live=true block=false format=time "
+        "caps=video/x-raw,format=BGR,width={w},height={h},framerate={fps}/1 "
+        "! videoconvert "
+        "! video/x-raw,format=I420 "
+        "! x264enc tune=zerolatency bitrate=4000 speed-preset=ultrafast "
+        "! h264parse "
+        "! rtph264pay name=pay0 pt=96"
+    )
 
     def __init__(
         self,
         port: int = 8554,
-        path: str = "/live",   # kept for API compat
-        dest_host: str = "127.0.0.1",
-        width: int = 640,
-        height: int = 480,
+        path: str = "/live",
+        width: int = 1280,
+        height: int = 720,
         fps: int = 30,
     ) -> None:
-        self.port      = port
-        self.dest_host = dest_host
-        self.width     = width
-        self.height    = height
-        self.fps       = fps
+        self.port   = port
+        self.path   = path
+        self.width  = width
+        self.height = height
+        self.fps    = fps
 
-        self._pipeline   = None
-        self._appsrc     = None
-        self._pts: int   = 0
-        self._frame_dur  = int(1e9 / fps)   # nanoseconds
-        self._lock       = threading.Lock()
-        self._started    = False
+        self._appsrc: Optional[object] = None   # Gst.Element
+        self._pts: int = 0
+        self._frame_duration: int = 0           # nanoseconds
+        self._lock = threading.Lock()
+        self._started = False
+
+        if not _GST_RTSP_AVAILABLE:
+            logger.warning(
+                "GstRtspServer Python bindings not available. "
+                "RTSP output is DISABLED.  Install python3-gi and "
+                "gir1.2-gst-rtsp-server-1.0 inside the container."
+            )
 
     def start(self) -> None:
-        if not _GST_AVAILABLE:
-            logger.error(
-                "GStreamer Python bindings (gi) not available – "
-                "UDP stream disabled.  Web preview still works."
-            )
+        if not _GST_RTSP_AVAILABLE or self._started:
             return
 
         Gst.init(None)
 
-        for label, desc in (
-            ("nvv4l2h264enc (HW)", self._hw_desc()),
-            ("x264enc (SW)",       self._sw_desc()),
-        ):
-            logger.info("Trying UDP pipeline: %s", label)
-            try:
-                pipeline = Gst.parse_launch(desc)
-            except Exception as exc:
-                logger.warning("Pipeline parse failed [%s]: %s", label, exc)
-                continue
+        self._frame_duration = int(1e9 / self.fps)  # ns per frame
 
-            appsrc = pipeline.get_by_name("src")
-            if appsrc is None:
-                logger.warning("No appsrc in pipeline [%s]", label)
-                continue
+        server  = GstRtspServer.RTSPServer.new()
+        server.set_service(str(self.port))
 
-            ret = pipeline.set_state(Gst.State.PLAYING)
-            if ret == Gst.StateChangeReturn.FAILURE:
-                pipeline.set_state(Gst.State.NULL)
-                logger.warning("Pipeline failed to start [%s]", label)
-                continue
+        factory = GstRtspServer.RTSPMediaFactory.new()
+        factory.set_shared(True)   # one pipeline, many clients
 
-            self._pipeline  = pipeline
-            self._appsrc    = appsrc
-            self._started   = True
+        # Try HW encoder first; fall back to software
+        hw_pipeline  = self._PIPELINE_HW.format(
+            w=self.width, h=self.height, fps=self.fps
+        )
+        sw_pipeline  = self._PIPELINE_SW.format(
+            w=self.width, h=self.height, fps=self.fps
+        )
 
-            # GLib main loop — needed for GStreamer bus messages
-            loop = GLib.MainLoop()
-            threading.Thread(target=loop.run, daemon=True).start()
-
-            logger.info(
-                "UDP stream running [%s] → udp://@:%d  "
-                "  Play: ffplay udp://@:%d  |  vlc udp://@:%d",
-                label, self.port, self.port, self.port,
+        # Probe whether nvv4l2h264enc exists on this system
+        if Gst.ElementFactory.find("nvv4l2h264enc"):
+            logger.info("RTSP publisher: using nvv4l2h264enc (HW H.264).")
+            factory.set_launch(f"( {hw_pipeline} )")
+        else:
+            logger.warning(
+                "nvv4l2h264enc not found – falling back to x264enc (SW)."
             )
+            factory.set_launch(f"( {sw_pipeline} )")
+
+        factory.connect("media-configure", self._on_media_configure)
+
+        mounts = server.get_mount_points()
+        mounts.add_factory(self.path, factory)
+        server.attach(None)
+
+        logger.info(
+            "RTSP server listening on rtsp://0.0.0.0:%d%s", self.port, self.path
+        )
+
+        # Run the GLib main loop in a daemon thread
+        loop = GLib.MainLoop()
+        t = threading.Thread(target=loop.run, daemon=True)
+        t.start()
+
+        self._started = True
+
+    def _on_media_configure(self, factory, media) -> None:  # noqa: ARG002
+        """Called when a new RTSP session pipeline is built."""
+        element = media.get_element()
+        appsrc  = element.get_child_by_name("src")
+        if appsrc is None:
+            logger.error("RTSP publisher: could not find appsrc element.")
             return
-
-        logger.error(
-            "All UDP pipelines failed. "
-            "Check: gst-inspect-1.0 x264enc  and  gst-inspect-1.0 udpsink. "
-            "Web preview is still available."
-        )
-
-    def _hw_desc(self) -> str:
-        return (
-            f"appsrc name=src is-live=true block=false format=time "
-            f"max-bytes=0 max-buffers=2 leaky-type=downstream "
-            f"caps=video/x-raw,format=BGR,width={self.width},height={self.height},framerate={self.fps}/1 "
-            f"! videoconvert ! video/x-raw,format=I420 "
-            f"! nvv4l2h264enc maxperf-enable=1 bitrate=4000000 iframeinterval=30 "
-            f"! h264parse config-interval=-1 "
-            f"! rtph264pay pt=96 config-interval=-1 "
-            f"! udpsink host={self.dest_host} port={self.port} sync=false"
-        )
-
-    def _sw_desc(self) -> str:
-        return (
-            f"appsrc name=src is-live=true block=false format=time "
-            f"max-bytes=0 max-buffers=2 leaky-type=downstream "
-            f"caps=video/x-raw,format=BGR,width={self.width},height={self.height},framerate={self.fps}/1 "
-            f"! videoconvert ! video/x-raw,format=I420 "
-            f"! x264enc tune=zerolatency bitrate=4000 speed-preset=ultrafast key-int-max=30 "
-            f"! h264parse config-interval=-1 "
-            f"! rtph264pay pt=96 config-interval=-1 "
-            f"! udpsink host={self.dest_host} port={self.port} sync=false"
-        )
+        with self._lock:
+            self._appsrc = appsrc
+        logger.info("RTSP client connected – appsrc configured.")
 
     def push_frame(self, frame: np.ndarray) -> None:
-        if not self._started or self._appsrc is None:
+        """Push one annotated BGR frame into the RTSP pipeline (non-blocking)."""
+        if not _GST_RTSP_AVAILABLE or not self._started:
             return
+        with self._lock:
+            appsrc = self._appsrc
+        if appsrc is None:
+            return  # no client connected yet
 
+        # Resize if the frame dimensions changed (shouldn't happen, but safe)
         h, w = frame.shape[:2]
         if w != self.width or h != self.height:
             frame = cv2.resize(frame, (self.width, self.height))
 
-        buf = Gst.Buffer.new_wrapped(frame.tobytes())
+        data   = frame.tobytes()
+        buf    = Gst.Buffer.new_wrapped(data)
         buf.pts      = self._pts
-        buf.dts      = self._pts
-        buf.duration = self._frame_dur
-        self._pts   += self._frame_dur
+        buf.duration = self._frame_duration
+        self._pts   += self._frame_duration
 
-        ret = self._appsrc.emit("push-buffer", buf)
+        ret = appsrc.emit("push-buffer", buf)
         if ret != Gst.FlowReturn.OK:
-            logger.warning("appsrc push-buffer returned %s — resetting PTS", ret)
-            with self._lock:
-                self._pts = 0
+            logger.debug("appsrc push-buffer returned: %s", ret)
 
     @property
     def url(self) -> str:
-        return f"udp://@:{self.port}"
+        return f"rtsp://0.0.0.0:{self.port}{self.path}"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -259,7 +273,6 @@ class Detector:
         use_tensorrt: bool = False,
         rtsp_port: int = 8554,
         rtsp_path: str = "/live",
-        udp_dest: str = "127.0.0.1",
     ) -> None:
         self.camera_device  = camera_device
         self.camera_width   = camera_width
@@ -295,16 +308,15 @@ class Detector:
             "model": "",
             "backend": backend_label,
             "camera": camera_device,
-            "rtsp_output": f"udp://@:{rtsp_port}",
+            "rtsp_output": f"rtsp://<host>:{rtsp_port}{rtsp_path}",
         }
         self._running = False
         self._thread: Optional[threading.Thread] = None
 
-        # ── UDP publisher ───────────────────────────────────────────────────
+        # ── RTSP publisher ──────────────────────────────────────────────────
         self._publisher = RtspPublisher(
             port=rtsp_port,
             path=rtsp_path,
-            dest_host=udp_dest,
             width=camera_width,
             height=camera_height,
             fps=camera_fps,
@@ -370,24 +382,59 @@ class Detector:
 
     def _open_capture(self) -> cv2.VideoCapture:
         """
-        Open the USB camera via OpenCV V4L2 backend.
-        GStreamer read is skipped — this OpenCV build has GStreamer: NO,
-        so CAP_V4L2 is the only working path.
+        Open the USB camera.  Tries three methods in order:
+          1. GStreamer v4l2src with explicit caps (best, zero-copy on Jetson)
+          2. GStreamer v4l2src without forcing caps (lets camera negotiate)
+          3. OpenCV V4L2 backend directly with the device path string
         """
         dev = self.camera_device
         w   = self.camera_width
         h   = self.camera_height
         fps = self.camera_fps
 
-        # Try the device path string directly first (works on Linux)
+        # ── attempt 1: GStreamer with explicit resolution/framerate caps ────────
+        gst_explicit = (
+            f"v4l2src device={dev} "
+            f"! video/x-raw,width={w},height={h},framerate={fps}/1 "
+            f"! videoconvert "
+            f"! video/x-raw,format=BGR "
+            f"! appsink drop=1 sync=false"
+        )
+        cap = cv2.VideoCapture(gst_explicit, cv2.CAP_GSTREAMER)
+        if cap.isOpened():
+            logger.info("Opened %s via GStreamer (explicit caps).", dev)
+            return cap
+        cap.release()
+        logger.warning("GStreamer explicit-caps pipeline failed for %s.", dev)
+
+        # ── attempt 2: GStreamer letting the camera negotiate its own caps ───────
+        gst_auto = (
+            f"v4l2src device={dev} "
+            f"! videoconvert "
+            f"! video/x-raw,format=BGR "
+            f"! appsink drop=1 sync=false"
+        )
+        cap = cv2.VideoCapture(gst_auto, cv2.CAP_GSTREAMER)
+        if cap.isOpened():
+            logger.info("Opened %s via GStreamer (auto caps).", dev)
+            # Apply desired resolution/fps as hints (best-effort)
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH,  w)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
+            cap.set(cv2.CAP_PROP_FPS,          fps)
+            return cap
+        cap.release()
+        logger.warning("GStreamer auto-caps pipeline failed for %s.", dev)
+
+        # ── attempt 3: plain OpenCV V4L2 backend using the device path ──────────
+        # Pass the path string directly — OpenCV accepts both "/dev/videoN"
+        # strings and integer indices on Linux.
         cap = cv2.VideoCapture(dev, cv2.CAP_V4L2)
         if not cap.isOpened():
-            # Derive integer index (/dev/video0 → 0) as fallback
+            # Last resort: derive integer index and try that
             try:
                 idx = int(dev.replace("/dev/video", "")) if "/dev/video" in dev else int(dev)
             except ValueError:
                 idx = 0
-            logger.debug("Device path failed, trying index %d", idx)
             cap = cv2.VideoCapture(idx, cv2.CAP_V4L2)
 
         if not cap.isOpened():
@@ -400,9 +447,7 @@ class Detector:
         cap.set(cv2.CAP_PROP_FRAME_WIDTH,  w)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
         cap.set(cv2.CAP_PROP_FPS,          fps)
-        actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        logger.info("Opened %s via V4L2 (%dx%d).", dev, actual_w, actual_h)
+        logger.info("Opened %s via OpenCV V4L2 backend.", dev)
         return cap
 
     def _loop(self) -> None:

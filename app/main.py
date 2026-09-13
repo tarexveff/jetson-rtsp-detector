@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import os
+import socket
 import time
 from typing import Generator
 
@@ -38,11 +39,15 @@ MODEL_DIR      = os.environ.get("MODEL_DIR",     "/models")
 USE_TRT        = os.environ.get("USE_TENSORRT",  "0").strip() == "1"
 RTSP_OUT_PORT  = int(os.environ.get("RTSP_OUT_PORT",  "8554"))
 RTSP_OUT_PATH  = os.environ.get("RTSP_OUT_PATH", "/live").strip()
-# UDP_DEST: IP of the machine that will play the stream.
-# Use 127.0.0.1 to receive on the Jetson itself, or set to your viewer's IP.
-UDP_DEST       = os.environ.get("UDP_DEST", "127.0.0.1").strip()
 
-RTSP_OUTPUT_URL = f"udp://@:{RTSP_OUT_PORT}"
+# Best-effort host IP for display purposes
+def _host_ip() -> str:
+    try:
+        return socket.gethostbyname(socket.gethostname())
+    except Exception:
+        return "localhost"
+
+RTSP_OUTPUT_URL = f"rtsp://{_host_ip()}:{RTSP_OUT_PORT}{RTSP_OUT_PATH}"
 
 # ── detector ───────────────────────────────────────────────────────────────────
 detector = Detector(
@@ -56,7 +61,6 @@ detector = Detector(
     use_tensorrt=USE_TRT,
     rtsp_port=RTSP_OUT_PORT,
     rtsp_path=RTSP_OUT_PATH,
-    udp_dest=UDP_DEST,
 )
 detector.start()
 
@@ -128,7 +132,7 @@ def snapshot():
 # ── entry point ────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     logger.info(
-        "Starting web server on 0.0.0.0:%d  |  camera: %s  |  UDP stream: %s",
+        "Starting web server on 0.0.0.0:%d  |  camera: %s  |  RTSP output: %s",
         WEB_PORT, CAMERA_DEVICE, RTSP_OUTPUT_URL,
     )
     app.run(host="0.0.0.0", port=WEB_PORT, threaded=True)
