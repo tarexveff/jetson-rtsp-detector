@@ -232,11 +232,22 @@ class RtspPublisher:
         logger.info("RTSP client connected – appsrc configured.")
 
     def push_frame(self, frame: np.ndarray) -> None:
-        """Push one annotated BGR frame into the RTSP pipeline (non-blocking)."""
+        """Push one annotated BGR frame into the RTSP pipeline.
+
+        The actual GLib signal must be emitted from the GLib main-loop thread.
+        We schedule it with GLib.idle_add so the detector thread never blocks
+        waiting on GStreamer's internal mutex.
+        """
         if not _GST_RTSP_AVAILABLE or not self._started:
             return
+
+        # Snapshot both appsrc and the current pts under the lock so the
+        # GLib thread closure captures a consistent pair.
         with self._lock:
             appsrc = self._appsrc
+            pts    = self._pts
+            self._pts += self._frame_duration
+
         if appsrc is None:
             return  # no client connected yet
 
@@ -245,15 +256,18 @@ class RtspPublisher:
         if w != self.width or h != self.height:
             frame = cv2.resize(frame, (self.width, self.height))
 
-        data   = frame.tobytes()
-        buf    = Gst.Buffer.new_wrapped(data)
-        buf.pts      = self._pts
-        buf.duration = self._frame_duration
-        self._pts   += self._frame_duration
+        data = frame.tobytes()
 
-        ret = appsrc.emit("push-buffer", buf)
-        if ret != Gst.FlowReturn.OK:
-            logger.debug("appsrc push-buffer returned: %s", ret)
+        def _do_push() -> bool:
+            buf          = Gst.Buffer.new_wrapped(data)
+            buf.pts      = pts
+            buf.duration = self._frame_duration
+            ret = appsrc.emit("push-buffer", buf)
+            if ret != Gst.FlowReturn.OK:
+                logger.debug("appsrc push-buffer returned: %s", ret)
+            return False  # do not reschedule
+
+        GLib.idle_add(_do_push)
 
     @property
     def url(self) -> str:
