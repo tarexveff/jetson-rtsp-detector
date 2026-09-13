@@ -1,0 +1,338 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>USB Camera Object Detector</title>
+  <style>
+    /* ── reset / base ─────────────────────────────────────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: -apple-system, "Segoe UI", system-ui, sans-serif;
+      background: #0f1117;
+      color: #e2e8f0;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+
+    /* ── header ───────────────────────────────────────────────────────────── */
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0.75rem 1.5rem;
+      background: #1a1d27;
+      border-bottom: 1px solid #2d3148;
+    }
+    header h1 {
+      font-size: 1.1rem;
+      font-weight: 600;
+      letter-spacing: 0.02em;
+      color: #a5b4fc;
+    }
+    #status-dot {
+      width: 10px; height: 10px;
+      border-radius: 50%;
+      background: #6b7280;
+      display: inline-block;
+      margin-right: 0.45rem;
+      transition: background 0.4s;
+    }
+    #status-dot.live   { background: #22c55e; box-shadow: 0 0 6px #22c55e88; }
+    #status-dot.error  { background: #ef4444; }
+
+    /* ── layout ───────────────────────────────────────────────────────────── */
+    main {
+      flex: 1;
+      display: grid;
+      grid-template-columns: 1fr 280px;
+      gap: 1rem;
+      padding: 1rem 1.5rem;
+      max-width: 1400px;
+      width: 100%;
+      margin: 0 auto;
+    }
+
+    @media (max-width: 800px) {
+      main { grid-template-columns: 1fr; }
+    }
+
+    /* ── video panel ──────────────────────────────────────────────────────── */
+    #video-panel {
+      background: #000;
+      border-radius: 8px;
+      overflow: hidden;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      aspect-ratio: 16/9;
+      position: relative;
+      border: 1px solid #2d3148;
+    }
+    #video-panel img {
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+      display: block;
+    }
+    #overlay-text {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      color: #6b7280;
+      font-size: 1rem;
+      pointer-events: none;
+      display: none;
+    }
+
+    /* ── sidebar ──────────────────────────────────────────────────────────── */
+    aside {
+      display: flex;
+      flex-direction: column;
+      gap: 1rem;
+    }
+
+    .card {
+      background: #1a1d27;
+      border: 1px solid #2d3148;
+      border-radius: 8px;
+      padding: 1rem;
+    }
+    .card h2 {
+      font-size: 0.75rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: #6b7280;
+      margin-bottom: 0.75rem;
+    }
+
+    /* stat rows */
+    .stat-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 0.35rem 0;
+      border-bottom: 1px solid #2d314844;
+      font-size: 0.875rem;
+    }
+    .stat-row:last-child { border-bottom: none; }
+    .stat-label { color: #94a3b8; }
+    .stat-value { font-weight: 600; font-variant-numeric: tabular-nums; }
+    .stat-value.accent { color: #a5b4fc; }
+
+    /* detection list */
+    #det-list {
+      list-style: none;
+      max-height: 220px;
+      overflow-y: auto;
+      scrollbar-width: thin;
+      scrollbar-color: #2d3148 transparent;
+    }
+    #det-list li {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 0.3rem 0;
+      border-bottom: 1px solid #2d314844;
+      font-size: 0.82rem;
+    }
+    #det-list li:last-child { border-bottom: none; }
+    .det-name  { color: #e2e8f0; text-transform: capitalize; }
+    .det-conf  {
+      font-size: 0.75rem;
+      background: #1e3a5f;
+      color: #93c5fd;
+      padding: 0.1rem 0.45rem;
+      border-radius: 999px;
+      font-variant-numeric: tabular-nums;
+    }
+    #det-empty { color: #4b5563; font-size: 0.82rem; text-align: center; padding: 0.5rem 0; }
+
+    /* snapshot button */
+    #snap-btn {
+      width: 100%;
+      padding: 0.6rem;
+      background: #2d3148;
+      color: #a5b4fc;
+      border: 1px solid #3d4168;
+      border-radius: 6px;
+      font-size: 0.875rem;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+    #snap-btn:hover { background: #373c5c; }
+
+    /* ── footer ───────────────────────────────────────────────────────────── */
+    footer {
+      text-align: center;
+      font-size: 0.72rem;
+      color: #4b5563;
+      padding: 0.6rem;
+      border-top: 1px solid #2d3148;
+    }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>&#127909; USB Camera Object Detector</h1>
+  <span>
+    <span id="status-dot"></span>
+    <span id="status-label">Connecting…</span>
+  </span>
+</header>
+
+<main>
+  <!-- ── live feed ──────────────────────────────────────────────────────── -->
+  <section id="video-panel">
+    <img id="feed"
+         src="/stream"
+         alt="Live annotated stream"
+         onerror="handleStreamError()"
+         onload="handleStreamLoad()" />
+    <span id="overlay-text">Stream unavailable</span>
+  </section>
+
+  <!-- ── sidebar ────────────────────────────────────────────────────────── -->
+  <aside>
+    <!-- stream info -->
+    <div class="card">
+      <h2>Stream Info</h2>
+      <div class="stat-row">
+        <span class="stat-label">Model</span>
+        <span class="stat-value accent" id="s-model">{{ model }}</span>
+      </div>
+      <div class="stat-row">
+        <span class="stat-label">Camera</span>
+        <span class="stat-value" id="s-camera"
+              title="{{ camera_device }}"
+              style="max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">
+          {{ camera_device }}
+        </span>
+      </div>
+      <div class="stat-row">
+        <span class="stat-label">Resolution</span>
+        <span class="stat-value" id="s-res">—</span>
+      </div>
+      <div class="stat-row">
+        <span class="stat-label">FPS</span>
+        <span class="stat-value accent" id="s-fps">—</span>
+      </div>
+      <div class="stat-row">
+        <span class="stat-label">Confidence ≥</span>
+        <span class="stat-value" id="s-conf">{{ "%.0f%%"|format(confidence * 100) }}</span>
+      </div>
+      <div class="stat-row">
+        <span class="stat-label">Backend</span>
+        <span class="stat-value" id="s-backend">—</span>
+      </div>
+    </div>
+
+    <!-- UDP stream output -->
+    <div class="card">
+      <h2>Video Stream Output</h2>
+      <div class="stat-row" style="flex-direction:column;align-items:flex-start;gap:0.3rem">
+        <span class="stat-label">Stream URL</span>
+        <span class="stat-value accent"
+              id="s-rtsp"
+              style="font-size:0.78rem;word-break:break-all;">
+          {{ rtsp_output_url }}
+        </span>
+      </div>
+      <div style="margin-top:0.6rem;font-size:0.75rem;color:#6b7280;line-height:1.5">
+        Play with:<br>
+        <code style="color:#a5b4fc">ffplay "{{ rtsp_output_url }}?overrun_nonfatal=1"</code><br>
+        <code style="color:#a5b4fc">vlc {{ rtsp_output_url }}</code>
+      </div>
+    </div>
+
+    <!-- current detections -->
+    <div class="card">
+      <h2>Current Detections (<span id="det-count">0</span>)</h2>
+      <ul id="det-list">
+        <li id="det-empty">No detections yet</li>
+      </ul>
+    </div>
+
+    <!-- actions -->
+    <div class="card">
+      <h2>Actions</h2>
+      <button id="snap-btn" onclick="downloadSnapshot()">
+        &#128247; Save Snapshot
+      </button>
+    </div>
+  </aside>
+</main>
+
+<footer>Jetson Orin Nano · YOLOv8 · USB Camera → RTSP Object Detector</footer>
+
+<script>
+  /* ── stats polling ──────────────────────────────────────────────────────── */
+  let streamOk = false;
+  let lastDetections = [];
+
+  async function pollStats() {
+    try {
+      const r = await fetch("/stats");
+      if (!r.ok) return;
+      const d = await r.json();
+
+      document.getElementById("s-fps").textContent      = d.fps ?? "—";
+      document.getElementById("s-res").textContent      = d.resolution ?? "—";
+      document.getElementById("s-backend").textContent  = d.backend ?? "—";
+      document.getElementById("det-count").textContent  = d.detections ?? 0;
+
+      // Mark stream live once we have fps data
+      if (d.fps && d.fps > 0) setStatus(true);
+    } catch (_) {
+      setStatus(false);
+    }
+  }
+
+  function setStatus(live) {
+    const dot   = document.getElementById("status-dot");
+    const label = document.getElementById("status-label");
+    streamOk = live;
+    if (live) {
+      dot.className   = "live";
+      label.textContent = "Live";
+    } else {
+      dot.className   = "error";
+      label.textContent = "Reconnecting…";
+    }
+  }
+
+  /* ── stream img error / load ────────────────────────────────────────────── */
+  function handleStreamError() {
+    setStatus(false);
+    document.getElementById("overlay-text").style.display = "block";
+    // retry after 3 s
+    setTimeout(() => {
+      const img = document.getElementById("feed");
+      img.src = "/stream?" + Date.now();
+    }, 3000);
+  }
+
+  function handleStreamLoad() {
+    document.getElementById("overlay-text").style.display = "none";
+  }
+
+  /* ── snapshot download ──────────────────────────────────────────────────── */
+  function downloadSnapshot() {
+    const a   = document.createElement("a");
+    a.href    = "/snapshot?" + Date.now();
+    a.download = "snapshot_" + new Date().toISOString().replace(/[:.]/g, "-") + ".jpg";
+    a.click();
+  }
+
+  /* ── kick off polling ───────────────────────────────────────────────────── */
+  pollStats();
+  setInterval(pollStats, 1500);
+</script>
+
+</body>
+</html>

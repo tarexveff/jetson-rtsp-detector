@@ -1,0 +1,15 @@
+# ── web server ─────────────────────────────────────────────────────────────────
+flask>=3.0,<4.0
+
+# ── object detection ───────────────────────────────────────────────────────────
+# ultralytics handles YOLOv8 inference and TensorRT export
+ultralytics>=8.2,<9.0
+
+# ── utility ────────────────────────────────────────────────────────────────────
+numpy>=1.24,<2.0
+Pillow>=10.0,<11.0
+
+# NOTE: opencv is intentionally NOT listed here.
+# The dustynv/pytorch base image provides a Jetson-optimised OpenCV build with
+# GStreamer + CUDA support compiled in.  Installing any opencv pip wheel would
+# silently overwrite it with a CPU-only build and break camera capture.

@@ -1,0 +1,67 @@
+# docker-compose.yml (also works with podman-compose)
+#
+# Usage:
+#   export CAMERA_DEVICE=/dev/video0
+#   podman-compose up -d --build
+#
+# Or set variables in a .env file next to this file.
+#
+# Requires:  podman-compose  (pip install podman-compose)
+#            OR  docker compose  (works identically)
+
+version: "3.9"
+
+services:
+  detector:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      network: host
+      args:
+        # Run `cat /etc/nv_tegra_release` on the Jetson to find your JetPack.
+        # JetPack 6.0   → r36.2.0-cu122-torch2.2-ubuntu22.04
+        # JetPack 5.1.2 → r35.3.1-cu114-torch2.1-ubuntu20.04
+        JETPACK_TAG: "${JETPACK_TAG:-2.7-r36.4.0-cu128-24.04}"
+    image: rtsp-detector:latest
+    container_name: rtsp-detector
+    restart: unless-stopped
+
+    # ── privileged mode for Jetson GPU access ────────────────────────────────
+    # The Jetson Orin's GPU is an integrated SoC – passing individual device
+    # nodes is unreliable across JetPack versions.  privileged gives the
+    # container the same device access as the host, which is required for CUDA.
+    privileged: true
+
+    devices:
+      # USB camera – change to match your device node
+      - "${CAMERA_DEVICE:-/dev/video0}"
+
+    # ── network ──────────────────────────────────────────────────────────────
+    network_mode: host
+
+    # ── shared memory ────────────────────────────────────────────────────────
+    shm_size: "512m"
+
+    # ── model weight cache ───────────────────────────────────────────────────
+    volumes:
+      - ./models:/models:z
+
+    # ── environment ──────────────────────────────────────────────────────────
+    environment:
+      # Input: USB camera
+      CAMERA_DEVICE:  "${CAMERA_DEVICE:-/dev/video0}"
+      CAMERA_WIDTH:   "${CAMERA_WIDTH:-1280}"
+      CAMERA_HEIGHT:  "${CAMERA_HEIGHT:-720}"
+      CAMERA_FPS:     "${CAMERA_FPS:-30}"
+
+      # Detection tuning
+      CONFIDENCE:     "${CONFIDENCE:-0.40}"
+      MODEL_SIZE:     "${MODEL_SIZE:-n}"
+      USE_TENSORRT:   "${USE_TENSORRT:-0}"
+
+      # Output: RTSP server
+      RTSP_OUT_PORT:  "${RTSP_OUT_PORT:-8554}"
+      RTSP_OUT_PATH:  "${RTSP_OUT_PATH:-/live}"
+
+      # Web preview
+      WEB_PORT:       "${WEB_PORT:-8080}"
