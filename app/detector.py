@@ -115,12 +115,12 @@ class RtspPublisher:
     # Pipeline launched inside the RTSP session for each connecting client.
     # appsrc feeds BGR → videoconvert → I420 → HW H.264 encode → RTP packetise.
     #
-    # block=true  – makes push-buffer block instead of silently overflowing,
-    #               so back-pressure is surfaced rather than hiding a stall.
-    # queue leaky=downstream – drops the *oldest* buffered frame when the
-    #               encoder can't keep up, preventing the pipeline from hanging.
+    # block=false – push-buffer is called from the GLib main loop via idle_add;
+    #               blocking here would freeze the entire GLib/GStreamer dispatch.
+    # queue leaky=downstream – drops the oldest buffered frame when the encoder
+    #               can't keep up, so the pipeline never stalls.
     _PIPELINE_HW = (
-        "appsrc name=src is-live=true block=true format=time "
+        "appsrc name=src is-live=true block=false format=time "
         "caps=video/x-raw,format=BGR,width={w},height={h},framerate={fps}/1 "
         "! queue max-size-buffers=2 leaky=downstream "
         "! videoconvert "
@@ -131,7 +131,7 @@ class RtspPublisher:
     )
 
     _PIPELINE_SW = (
-        "appsrc name=src is-live=true block=true format=time "
+        "appsrc name=src is-live=true block=false format=time "
         "caps=video/x-raw,format=BGR,width={w},height={h},framerate={fps}/1 "
         "! queue max-size-buffers=2 leaky=downstream "
         "! videoconvert "
@@ -159,6 +159,8 @@ class RtspPublisher:
         self._pts: int = 0                      # reset to 0 on each new client session
         self._frame_duration: int = 0           # nanoseconds
         self._lock = threading.Lock()
+        self._push_pending = False              # True while one idle_add is queued
+        self._next_push: Optional[tuple] = None # (appsrc, data, pts) for next push
         self._started = False
 
         if not _GST_RTSP_AVAILABLE:
@@ -234,19 +236,22 @@ class RtspPublisher:
     def push_frame(self, frame: np.ndarray) -> None:
         """Push one annotated BGR frame into the RTSP pipeline.
 
-        The actual GLib signal must be emitted from the GLib main-loop thread.
-        We schedule it with GLib.idle_add so the detector thread never blocks
-        waiting on GStreamer's internal mutex.
+        push-buffer is emitted from the GLib main-loop thread via idle_add so
+        the detector thread never touches GStreamer internals directly.
+
+        Only one idle callback is queued at a time (_push_pending flag).  If
+        the GLib loop is momentarily busy and a new frame arrives before the
+        previous callback fires, the old callback's data is replaced in-place —
+        the GLib loop always pushes the *freshest* frame, never a burst.
         """
         if not _GST_RTSP_AVAILABLE or not self._started:
             return
 
-        # Snapshot both appsrc and the current pts under the lock so the
-        # GLib thread closure captures a consistent pair.
         with self._lock:
             appsrc = self._appsrc
             pts    = self._pts
             self._pts += self._frame_duration
+            already_pending = self._push_pending
 
         if appsrc is None:
             return  # no client connected yet
@@ -258,11 +263,25 @@ class RtspPublisher:
 
         data = frame.tobytes()
 
+        # Replace the shared "next frame" slot so the pending callback (if any)
+        # will send this frame instead of the stale one.
+        with self._lock:
+            self._next_push = (appsrc, data, pts)
+            if already_pending:
+                return  # existing idle callback will pick up _next_push
+            self._push_pending = True
+
         def _do_push() -> bool:
-            buf          = Gst.Buffer.new_wrapped(data)
-            buf.pts      = pts
+            with self._lock:
+                payload = self._next_push
+                self._push_pending = False
+            if payload is None:
+                return False
+            _appsrc, _data, _pts = payload
+            buf          = Gst.Buffer.new_wrapped(_data)
+            buf.pts      = _pts
             buf.duration = self._frame_duration
-            ret = appsrc.emit("push-buffer", buf)
+            ret = _appsrc.emit("push-buffer", buf)
             if ret != Gst.FlowReturn.OK:
                 logger.debug("appsrc push-buffer returned: %s", ret)
             return False  # do not reschedule
