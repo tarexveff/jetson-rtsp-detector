@@ -101,50 +101,48 @@ class RtspPublisher:
 
     Clients connect to:  rtsp://<host>:<rtsp_port>/<rtsp_path>
 
-    Implementation notes
-    ────────────────────
-    GstRtspServer works by mounting a "media factory" at a URL path.  We use
-    an appsrc-based factory so we can push raw BGR frames from Python.  Each
-    frame is converted to I420 and encoded to H.264 by nvv4l2h264enc (Jetson
-    HW encoder) with a software x264enc fallback.
+    Design
+    ──────
+    GstRtspServer builds a fresh pipeline for each session and drives it with
+    its own internal clock.  The correct integration point for appsrc is the
+    need-data / enough-data signal pair:
 
-    The GLib main loop must run in its own thread so that GStreamer can
-    dispatch its internal callbacks.
+      need-data  → appsrc wants a buffer; set _feeding=True so push_frame
+                   will deliver the next available frame via appsrc.emit().
+      enough-data → appsrc's internal queue is full; set _feeding=False to
+                   pause pushing until need-data fires again.
+
+    Both signals are dispatched on the GLib main-loop thread, so emit() is
+    always called from the correct thread — no idle_add, no cross-thread
+    signal races.
+
+    The detector thread only writes to the _latest_frame slot (a raw bytes
+    object protected by a lock).  need-data reads from that slot and pushes
+    the most recent frame, keeping latency at one frame regardless of the
+    inference rate.
     """
 
-    # Pipeline launched inside the RTSP session for each connecting client.
-    # appsrc feeds BGR → videoconvert → I420 → HW H.264 encode → RTP packetise.
-    #
-    # block=false – push-buffer is called from the GLib main loop via idle_add;
-    #               blocking here would freeze the entire GLib/GStreamer dispatch.
-    # queue leaky=downstream – drops the oldest buffered frame when the encoder
-    #               can't keep up, so the pipeline never stalls.
+    # iframeinterval / key-int-max=30 → IDR every ~1 s so late-connecting
+    # clients decode within one GOP.
+    # config-interval=-1 → SPS/PPS resent before every IDR so clients that
+    # connect mid-stream don't wait for the next in-band parameter set.
     _PIPELINE_HW = (
         "appsrc name=src is-live=true block=false format=time "
         "caps=video/x-raw,format=BGR,width={w},height={h},framerate={fps}/1 "
-        "! queue max-size-buffers=2 leaky=downstream "
         "! videoconvert "
         "! video/x-raw,format=I420 "
-        # iframeinterval=30 → IDR every 30 frames (~1 s at 30 fps) so a late-
-        # connecting client never waits more than one GOP for the first keyframe.
         "! nvv4l2h264enc maxperf-enable=1 bitrate=4000000 iframeinterval=30 "
         "! h264parse "
-        # config-interval=-1 → re-send SPS/PPS before every IDR so clients
-        # that connect mid-stream can decode immediately without waiting for
-        # the next in-band parameter set.
         "! rtph264pay name=pay0 pt=96 config-interval=-1"
     )
 
     _PIPELINE_SW = (
         "appsrc name=src is-live=true block=false format=time "
         "caps=video/x-raw,format=BGR,width={w},height={h},framerate={fps}/1 "
-        "! queue max-size-buffers=2 leaky=downstream "
         "! videoconvert "
         "! video/x-raw,format=I420 "
-        # key-int-max=30 → IDR every 30 frames (~1 s at 30 fps).
         "! x264enc tune=zerolatency bitrate=4000 speed-preset=ultrafast key-int-max=30 "
         "! h264parse "
-        # config-interval=-1 → SPS/PPS repeated before every IDR.
         "! rtph264pay name=pay0 pt=96 config-interval=-1"
     )
 
@@ -162,12 +160,10 @@ class RtspPublisher:
         self.height = height
         self.fps    = fps
 
-        self._appsrc: Optional[object] = None   # Gst.Element for the current session
-        self._pts: int = 0                      # reset to 0 on each new client session
-        self._frame_duration: int = 0           # nanoseconds
+        self._frame_duration: int = 0       # ns per frame, set in start()
+        self._stream_start: Optional[float] = None  # wall-clock origin, ns
         self._lock = threading.Lock()
-        self._push_pending = False              # True while one idle_add is queued
-        self._next_push: Optional[tuple] = None # (appsrc, data, pts) for next push
+        self._latest_frame: Optional[bytes] = None  # most recent BGR tobytes()
         self._started = False
 
         if not _GST_RTSP_AVAILABLE:
@@ -182,32 +178,22 @@ class RtspPublisher:
             return
 
         Gst.init(None)
-
-        self._frame_duration = int(1e9 / self.fps)  # ns per frame
+        self._frame_duration = int(1e9 / self.fps)
 
         server  = GstRtspServer.RTSPServer.new()
         server.set_service(str(self.port))
 
         factory = GstRtspServer.RTSPMediaFactory.new()
-        factory.set_shared(True)   # one pipeline, many clients
+        factory.set_shared(True)
 
-        # Try HW encoder first; fall back to software
-        hw_pipeline  = self._PIPELINE_HW.format(
-            w=self.width, h=self.height, fps=self.fps
-        )
-        sw_pipeline  = self._PIPELINE_SW.format(
-            w=self.width, h=self.height, fps=self.fps
-        )
-
-        # Probe whether nvv4l2h264enc exists on this system
         if Gst.ElementFactory.find("nvv4l2h264enc"):
             logger.info("RTSP publisher: using nvv4l2h264enc (HW H.264).")
-            factory.set_launch(f"( {hw_pipeline} )")
+            factory.set_launch("( " + self._PIPELINE_HW.format(
+                w=self.width, h=self.height, fps=self.fps) + " )")
         else:
-            logger.warning(
-                "nvv4l2h264enc not found – falling back to x264enc (SW)."
-            )
-            factory.set_launch(f"( {sw_pipeline} )")
+            logger.warning("nvv4l2h264enc not found – falling back to x264enc (SW).")
+            factory.set_launch("( " + self._PIPELINE_SW.format(
+                w=self.width, h=self.height, fps=self.fps) + " )")
 
         factory.connect("media-configure", self._on_media_configure)
 
@@ -215,97 +201,100 @@ class RtspPublisher:
         mounts.add_factory(self.path, factory)
         server.attach(None)
 
-        logger.info(
-            "RTSP server listening on rtsp://0.0.0.0:%d%s", self.port, self.path
-        )
+        logger.info("RTSP server listening on rtsp://0.0.0.0:%d%s", self.port, self.path)
 
-        # Run the GLib main loop in a daemon thread
         loop = GLib.MainLoop()
-        t = threading.Thread(target=loop.run, daemon=True)
-        t.start()
-
+        threading.Thread(target=loop.run, daemon=True).start()
         self._started = True
 
     def _on_media_configure(self, factory, media) -> None:  # noqa: ARG002
-        """Called when a new RTSP session pipeline is built."""
-        element = media.get_element()
-        appsrc  = element.get_child_by_name("src")
-        if appsrc is None:
-            logger.error("RTSP publisher: could not find appsrc element.")
-            return
-        with self._lock:
-            self._appsrc = appsrc
-            # Reset PTS so each new client session starts from t=0, avoiding
-            # decoder rejection of a stream that begins with a large timestamp.
-            self._pts = 0
-            # Also clear any stale pending-push slot from the previous session
-            # so the idle callback can't deliver a frame with a pre-reset PTS.
-            self._next_push    = None
-            self._push_pending = False
-        logger.info("RTSP client connected – appsrc configured.")
+        """Wire need-data onto the appsrc for this session."""
+        try:
+            element = media.get_element()
+            appsrc  = element.get_child_by_name("src")
+            if appsrc is None:
+                logger.error("RTSP publisher: appsrc element not found in pipeline.")
+                logger.error("Pipeline element names: %s",
+                    [e.get_name() for e in element.iterate_elements()])
+                return
 
-        # Ask the encoder to produce an IDR frame as the very next output.
-        # This means the connecting client gets a decodable keyframe on the
-        # first RTP packet it receives instead of waiting up to key-int-max
-        # frames for the next natural IDR.
-        pad = element.get_static_pad("src")
-        if pad:
-            event = Gst.Event.new_custom(
-                Gst.EventType.CUSTOM_UPSTREAM,
-                Gst.Structure.new_from_string("GstForceKeyUnit,all-headers=TRUE"),
-            )
-            pad.send_event(event)
+            with self._lock:
+                self._stream_start = None
+
+            appsrc.connect("need-data", self._on_need_data, appsrc)
+
+            # Forward any GStreamer bus errors to the Python logger so they
+            # appear in the application logs instead of being swallowed silently.
+            bus = element.get_bus()
+            if bus:
+                bus.add_signal_watch()
+                bus.connect("message::error",   self._on_bus_error)
+                bus.connect("message::warning",  self._on_bus_warning)
+                bus.connect("message::state-changed", self._on_bus_state)
+
+            logger.info("RTSP session configured; pipeline: %s",
+                        element.get_name())
+        except Exception:
+            logger.exception("RTSP _on_media_configure failed")
+
+    def _on_bus_error(self, bus, message) -> None:  # noqa: ARG002
+        err, dbg = message.parse_error()
+        logger.error("GStreamer pipeline ERROR: %s | %s", err, dbg)
+
+    def _on_bus_warning(self, bus, message) -> None:  # noqa: ARG002
+        warn, dbg = message.parse_warning()
+        logger.warning("GStreamer pipeline WARNING: %s | %s", warn, dbg)
+
+    def _on_bus_state(self, bus, message) -> None:  # noqa: ARG002
+        old, new, pending = message.parse_state_changed()
+        src = message.src.get_name() if message.src else "?"
+        logger.debug("GStreamer state: %s  %s→%s (pending: %s)",
+                     src, old.value_nick, new.value_nick, pending.value_nick)
+
+    def _on_need_data(self, _src, _length, appsrc) -> None:
+        """Called by GStreamer on the GLib thread each time a buffer is needed.
+
+        Must always push exactly one buffer (or EOS) — returning without
+        pushing causes appsrc to stall and never call need-data again.
+        If no frame is available yet we push a GAP buffer so the pipeline
+        clock keeps ticking.
+        """
+        try:
+            now = time.monotonic()
+
+            with self._lock:
+                data = self._latest_frame
+                if self._stream_start is None:
+                    self._stream_start = now
+                pts = int((now - self._stream_start) * 1e9)
+
+            if data is not None:
+                buf = Gst.Buffer.new_wrapped(data)
+            else:
+                # No frame yet — push a silent gap buffer to keep the clock alive.
+                buf = Gst.Buffer.new_allocate(None, self.width * self.height * 3, None)
+                buf.add_flags(Gst.BufferFlags.GAP)
+
+            buf.pts      = pts
+            buf.duration = self._frame_duration
+            ret = appsrc.emit("push-buffer", buf)
+            if ret != Gst.FlowReturn.OK:
+                logger.warning("appsrc push-buffer returned: %s", ret)
+        except Exception:
+            logger.exception("RTSP _on_need_data failed")
 
     def push_frame(self, frame: np.ndarray) -> None:
-        """Push one annotated BGR frame into the RTSP pipeline.
-
-        push-buffer is emitted from the GLib main-loop thread via idle_add so
-        the detector thread never touches GStreamer internals directly.
-
-        Only one idle_add is ever in-flight at a time.  New frames overwrite
-        the pending slot so the GLib loop always delivers the freshest frame.
-        All state transitions happen inside a single lock section to prevent
-        races between push_frame and the idle callback.
-        """
+        """Store the latest annotated frame so need-data can deliver it."""
         if not _GST_RTSP_AVAILABLE or not self._started:
             return
 
-        # Resize before taking the lock – tobytes() is the expensive part.
         h, w = frame.shape[:2]
         if w != self.width or h != self.height:
             frame = cv2.resize(frame, (self.width, self.height))
         data = frame.tobytes()
 
         with self._lock:
-            if self._appsrc is None:
-                return  # no client connected yet
-            pts        = self._pts
-            self._pts += self._frame_duration
-            # Always overwrite so the pending callback delivers the latest frame.
-            self._next_push = (self._appsrc, data, pts)
-            if self._push_pending:
-                return  # existing callback will consume _next_push
-            self._push_pending = True
-
-        def _do_push() -> bool:
-            with self._lock:
-                payload            = self._next_push
-                self._next_push    = None
-            # Emit outside the lock so GStreamer doesn't contend with push_frame.
-            if payload is not None:
-                _appsrc, _data, _pts = payload
-                buf          = Gst.Buffer.new_wrapped(_data)
-                buf.pts      = _pts
-                buf.duration = self._frame_duration
-                ret = _appsrc.emit("push-buffer", buf)
-                if ret != Gst.FlowReturn.OK:
-                    logger.debug("appsrc push-buffer returned: %s", ret)
-            # Clear pending *after* emit so push_frame never sees a false gap.
-            with self._lock:
-                self._push_pending = False
-            return False  # do not reschedule
-
-        GLib.idle_add(_do_push)
+            self._latest_frame = data
 
     @property
     def url(self) -> str:
