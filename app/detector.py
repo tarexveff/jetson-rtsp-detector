@@ -125,9 +125,14 @@ class RtspPublisher:
         "! queue max-size-buffers=2 leaky=downstream "
         "! videoconvert "
         "! video/x-raw,format=I420 "
-        "! nvv4l2h264enc maxperf-enable=1 bitrate=4000000 "
+        # iframeinterval=30 → IDR every 30 frames (~1 s at 30 fps) so a late-
+        # connecting client never waits more than one GOP for the first keyframe.
+        "! nvv4l2h264enc maxperf-enable=1 bitrate=4000000 iframeinterval=30 "
         "! h264parse "
-        "! rtph264pay name=pay0 pt=96"
+        # config-interval=-1 → re-send SPS/PPS before every IDR so clients
+        # that connect mid-stream can decode immediately without waiting for
+        # the next in-band parameter set.
+        "! rtph264pay name=pay0 pt=96 config-interval=-1"
     )
 
     _PIPELINE_SW = (
@@ -136,9 +141,11 @@ class RtspPublisher:
         "! queue max-size-buffers=2 leaky=downstream "
         "! videoconvert "
         "! video/x-raw,format=I420 "
-        "! x264enc tune=zerolatency bitrate=4000 speed-preset=ultrafast "
+        # key-int-max=30 → IDR every 30 frames (~1 s at 30 fps).
+        "! x264enc tune=zerolatency bitrate=4000 speed-preset=ultrafast key-int-max=30 "
         "! h264parse "
-        "! rtph264pay name=pay0 pt=96"
+        # config-interval=-1 → SPS/PPS repeated before every IDR.
+        "! rtph264pay name=pay0 pt=96 config-interval=-1"
     )
 
     def __init__(
@@ -231,7 +238,23 @@ class RtspPublisher:
             # Reset PTS so each new client session starts from t=0, avoiding
             # decoder rejection of a stream that begins with a large timestamp.
             self._pts = 0
+            # Also clear any stale pending-push slot from the previous session
+            # so the idle callback can't deliver a frame with a pre-reset PTS.
+            self._next_push    = None
+            self._push_pending = False
         logger.info("RTSP client connected – appsrc configured.")
+
+        # Ask the encoder to produce an IDR frame as the very next output.
+        # This means the connecting client gets a decodable keyframe on the
+        # first RTP packet it receives instead of waiting up to key-int-max
+        # frames for the next natural IDR.
+        pad = element.get_static_pad("src")
+        if pad:
+            event = Gst.Event.new_custom(
+                Gst.EventType.CUSTOM_UPSTREAM,
+                Gst.Structure.new_from_string("GstForceKeyUnit,all-headers=TRUE"),
+            )
+            pad.send_event(event)
 
     def push_frame(self, frame: np.ndarray) -> None:
         """Push one annotated BGR frame into the RTSP pipeline.
@@ -239,51 +262,47 @@ class RtspPublisher:
         push-buffer is emitted from the GLib main-loop thread via idle_add so
         the detector thread never touches GStreamer internals directly.
 
-        Only one idle callback is queued at a time (_push_pending flag).  If
-        the GLib loop is momentarily busy and a new frame arrives before the
-        previous callback fires, the old callback's data is replaced in-place —
-        the GLib loop always pushes the *freshest* frame, never a burst.
+        Only one idle_add is ever in-flight at a time.  New frames overwrite
+        the pending slot so the GLib loop always delivers the freshest frame.
+        All state transitions happen inside a single lock section to prevent
+        races between push_frame and the idle callback.
         """
         if not _GST_RTSP_AVAILABLE or not self._started:
             return
 
-        with self._lock:
-            appsrc = self._appsrc
-            pts    = self._pts
-            self._pts += self._frame_duration
-            already_pending = self._push_pending
-
-        if appsrc is None:
-            return  # no client connected yet
-
-        # Resize if the frame dimensions changed (shouldn't happen, but safe)
+        # Resize before taking the lock – tobytes() is the expensive part.
         h, w = frame.shape[:2]
         if w != self.width or h != self.height:
             frame = cv2.resize(frame, (self.width, self.height))
-
         data = frame.tobytes()
 
-        # Replace the shared "next frame" slot so the pending callback (if any)
-        # will send this frame instead of the stale one.
         with self._lock:
-            self._next_push = (appsrc, data, pts)
-            if already_pending:
-                return  # existing idle callback will pick up _next_push
+            if self._appsrc is None:
+                return  # no client connected yet
+            pts        = self._pts
+            self._pts += self._frame_duration
+            # Always overwrite so the pending callback delivers the latest frame.
+            self._next_push = (self._appsrc, data, pts)
+            if self._push_pending:
+                return  # existing callback will consume _next_push
             self._push_pending = True
 
         def _do_push() -> bool:
             with self._lock:
-                payload = self._next_push
+                payload            = self._next_push
+                self._next_push    = None
+            # Emit outside the lock so GStreamer doesn't contend with push_frame.
+            if payload is not None:
+                _appsrc, _data, _pts = payload
+                buf          = Gst.Buffer.new_wrapped(_data)
+                buf.pts      = _pts
+                buf.duration = self._frame_duration
+                ret = _appsrc.emit("push-buffer", buf)
+                if ret != Gst.FlowReturn.OK:
+                    logger.debug("appsrc push-buffer returned: %s", ret)
+            # Clear pending *after* emit so push_frame never sees a false gap.
+            with self._lock:
                 self._push_pending = False
-            if payload is None:
-                return False
-            _appsrc, _data, _pts = payload
-            buf          = Gst.Buffer.new_wrapped(_data)
-            buf.pts      = _pts
-            buf.duration = self._frame_duration
-            ret = _appsrc.emit("push-buffer", buf)
-            if ret != Gst.FlowReturn.OK:
-                logger.debug("appsrc push-buffer returned: %s", ret)
             return False  # do not reschedule
 
         GLib.idle_add(_do_push)
