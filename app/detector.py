@@ -114,9 +114,15 @@ class RtspPublisher:
 
     # Pipeline launched inside the RTSP session for each connecting client.
     # appsrc feeds BGR → videoconvert → I420 → HW H.264 encode → RTP packetise.
+    #
+    # block=true  – makes push-buffer block instead of silently overflowing,
+    #               so back-pressure is surfaced rather than hiding a stall.
+    # queue leaky=downstream – drops the *oldest* buffered frame when the
+    #               encoder can't keep up, preventing the pipeline from hanging.
     _PIPELINE_HW = (
-        "appsrc name=src is-live=true block=false format=time "
+        "appsrc name=src is-live=true block=true format=time "
         "caps=video/x-raw,format=BGR,width={w},height={h},framerate={fps}/1 "
+        "! queue max-size-buffers=2 leaky=downstream "
         "! videoconvert "
         "! video/x-raw,format=I420 "
         "! nvv4l2h264enc maxperf-enable=1 bitrate=4000000 "
@@ -125,8 +131,9 @@ class RtspPublisher:
     )
 
     _PIPELINE_SW = (
-        "appsrc name=src is-live=true block=false format=time "
+        "appsrc name=src is-live=true block=true format=time "
         "caps=video/x-raw,format=BGR,width={w},height={h},framerate={fps}/1 "
+        "! queue max-size-buffers=2 leaky=downstream "
         "! videoconvert "
         "! video/x-raw,format=I420 "
         "! x264enc tune=zerolatency bitrate=4000 speed-preset=ultrafast "
@@ -148,8 +155,8 @@ class RtspPublisher:
         self.height = height
         self.fps    = fps
 
-        self._appsrc: Optional[object] = None   # Gst.Element
-        self._pts: int = 0
+        self._appsrc: Optional[object] = None   # Gst.Element for the current session
+        self._pts: int = 0                      # reset to 0 on each new client session
         self._frame_duration: int = 0           # nanoseconds
         self._lock = threading.Lock()
         self._started = False
@@ -219,6 +226,9 @@ class RtspPublisher:
             return
         with self._lock:
             self._appsrc = appsrc
+            # Reset PTS so each new client session starts from t=0, avoiding
+            # decoder rejection of a stream that begins with a large timestamp.
+            self._pts = 0
         logger.info("RTSP client connected – appsrc configured.")
 
     def push_frame(self, frame: np.ndarray) -> None:
@@ -393,12 +403,14 @@ class Detector:
         fps = self.camera_fps
 
         # ── attempt 1: GStreamer with explicit resolution/framerate caps ────────
+        # timeout=5000000000 (5 s in ns) makes the source return an error buffer
+        # instead of blocking indefinitely if the camera stalls.
         gst_explicit = (
-            f"v4l2src device={dev} "
+            f"v4l2src device={dev} do-timestamp=true "
             f"! video/x-raw,width={w},height={h},framerate={fps}/1 "
             f"! videoconvert "
             f"! video/x-raw,format=BGR "
-            f"! appsink drop=1 sync=false"
+            f"! appsink drop=true sync=false max-buffers=2"
         )
         cap = cv2.VideoCapture(gst_explicit, cv2.CAP_GSTREAMER)
         if cap.isOpened():
@@ -409,10 +421,10 @@ class Detector:
 
         # ── attempt 2: GStreamer letting the camera negotiate its own caps ───────
         gst_auto = (
-            f"v4l2src device={dev} "
+            f"v4l2src device={dev} do-timestamp=true "
             f"! videoconvert "
             f"! video/x-raw,format=BGR "
-            f"! appsink drop=1 sync=false"
+            f"! appsink drop=true sync=false max-buffers=2"
         )
         cap = cv2.VideoCapture(gst_auto, cv2.CAP_GSTREAMER)
         if cap.isOpened():
@@ -436,6 +448,9 @@ class Detector:
             except ValueError:
                 idx = 0
             cap = cv2.VideoCapture(idx, cv2.CAP_V4L2)
+        # Limit the internal V4L2 buffer to 2 frames so cap.read() returns
+        # quickly instead of draining a deep queue of stale frames.
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)
 
         if not cap.isOpened():
             raise RuntimeError(
