@@ -1,13 +1,19 @@
 #!/usr/bin/env bash
-# run.sh – build and launch the USB-camera object detector on a Jetson Orin Nano
+# run.sh – build and launch the object detector on a Jetson Orin Nano
+#
+# CAMERA_DEVICE can be a local V4L2 device OR a URL:
 #
 # Usage:
 #   chmod +x run.sh
-#   ./run.sh                          # uses /dev/video0
-#   ./run.sh /dev/video2              # specific USB camera device
+#   ./run.sh                          # uses /dev/video0 (default)
+#   ./run.sh /dev/video2              # specific local device
+#   CAMERA_DEVICE=rtsp://user:pass@192.168.1.50/stream1 ./run.sh   # RTSP URL
+#   CAMERA_DEVICE=http://192.168.1.60/video ./run.sh                # HTTP/MJPEG
 #
 # Optional environment variables (export before running, or edit defaults below):
-#   CAMERA_DEVICE   – V4L2 device node            (default: /dev/video0)
+#   CAMERA_DEVICE   – V4L2 device node (e.g. /dev/video0) OR a URL
+#                     (rtsp://, rtsps://, rtmp://, http://, https://)
+#                     (default: /dev/video0)
 #   CAMERA_WIDTH    – capture width  in pixels     (default: 1280)
 #   CAMERA_HEIGHT   – capture height in pixels     (default: 720)
 #   CAMERA_FPS      – capture frame rate           (default: 30)
@@ -43,8 +49,13 @@ IMAGE_NAME="${IMAGE_NAME:-rtsp-detector}"
 MODEL_CACHE_DIR="${MODEL_CACHE_DIR:-$(pwd)/models}"
 CONTAINER_NAME="rtsp-detector"
 
-# ── validate camera device ────────────────────────────────────────────────────
-if [[ ! -e "${CAMERA_DEVICE}" ]]; then
+# ── validate camera device (skip check for URLs) ─────────────────────────────
+if [[ "${CAMERA_DEVICE}" != rtsp://* ]] && \
+   [[ "${CAMERA_DEVICE}" != rtsps://* ]] && \
+   [[ "${CAMERA_DEVICE}" != rtmp://* ]] && \
+   [[ "${CAMERA_DEVICE}" != http://* ]] && \
+   [[ "${CAMERA_DEVICE}" != https://* ]] && \
+   [[ ! -e "${CAMERA_DEVICE}" ]]; then
   echo "WARNING: ${CAMERA_DEVICE} not found on this host."
   echo "  Available video devices:"
   ls /dev/video* 2>/dev/null || echo "  (none)"
@@ -66,6 +77,7 @@ podman build \
   .
 
 # ── resolve video group ID so the container can access /dev/videoN ───────────
+# Only relevant for local devices; URLs don't require device permissions.
 VIDEO_GID=$(getent group video 2>/dev/null | cut -d: -f3 || stat -c '%g' "${CAMERA_DEVICE}" 2>/dev/null || echo "")
 
 # ── mount host Jetson CUDA/tegra userspace libraries ─────────────────────────
@@ -100,7 +112,8 @@ podman rm -f "${CONTAINER_NAME}" 2>/dev/null || true
 
 # ── run ───────────────────────────────────────────────────────────────────────
 echo "► Starting container '${CONTAINER_NAME}' …"
-echo "   Camera      : ${CAMERA_DEVICE}  (${CAMERA_WIDTH}×${CAMERA_HEIGHT} @ ${CAMERA_FPS}fps)"
+echo "   Input       : ${CAMERA_DEVICE}"
+[[ "${CAMERA_DEVICE}" != *://* ]] && echo "   Resolution  : ${CAMERA_WIDTH}×${CAMERA_HEIGHT} @ ${CAMERA_FPS}fps  (local device)"
 echo "   Model       : YOLOv8${MODEL_SIZE}  (TensorRT: ${USE_TENSORRT})"
 echo "   Confidence  : ${CONFIDENCE}"
 echo "   RTSP output : rtsp://${HOST_IP}:${RTSP_OUT_PORT}${RTSP_OUT_PATH}"
@@ -109,6 +122,10 @@ echo "   Web preview : http://${HOST_IP}:${WEB_PORT}"
 # Build optional group-add flag only if we found the video GID
 GROUP_ADD=()
 [[ -n "${VIDEO_GID}" ]] && GROUP_ADD+=("--group-add" "${VIDEO_GID}")
+
+# Pass --device only for local device paths, not for URLs
+DEVICE_ARG=()
+[[ "${CAMERA_DEVICE}" != *://* ]] && DEVICE_ARG+=("--device" "${CAMERA_DEVICE}")
 
 podman run \
   --detach \
@@ -119,7 +136,7 @@ podman run \
   --user root \
   "${GROUP_ADD[@]}" \
   \
-  --device "${CAMERA_DEVICE}" \
+  "${DEVICE_ARG[@]}" \
   \
   --network host \
   --shm-size 512m \

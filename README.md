@@ -1,14 +1,16 @@
-# RTSP Object Detector — Jetson Orin Nano
+# Object Detector — Jetson Orin Nano
 
-A containerised live object-detection application for the **NVIDIA Jetson Orin Nano**.  
-It ingests any RTSP video stream, runs **YOLOv8** inference on the Jetson GPU, overlays labelled bounding boxes (class name + confidence), and streams the annotated video to a web browser over your local network.
+A containerised live object-detection application for the **NVIDIA Jetson Orin Nano**.
+It ingests video from a **URL** (RTSP, RTMP, HTTP/MJPEG) or a **local V4L2 device** (`/dev/videoN`), runs **YOLOv8** inference on the Jetson GPU, overlays labelled bounding boxes (class name + confidence), and streams the annotated video to a web browser and an RTSP output over your local network.
 
 ```
-RTSP Camera ──► GStreamer/nvv4l2 HW decode ──► YOLOv8 (CUDA / TensorRT)
-                                                       │
-                                             Draw boxes + labels
-                                                       │
+RTSP/HTTP URL  ─┐
+                ├──► OpenCV / FFMPEG decode ──► YOLOv8 (CUDA / TensorRT)
+/dev/videoN  ──┘    (hw-accelerated where available)      │
+                                                 Draw boxes + labels
+                                                           │
                                          Flask MJPEG stream ──► Browser
+                                         GStreamer RTSP out  ──► VLC/ffplay
 ```
 
 ---
@@ -56,8 +58,17 @@ cd jetson-rtsp-detector
 ### 2 — Build and run (single command)
 
 ```bash
-# Replace the URL with your camera's RTSP address
-./run.sh rtsp://admin:password@192.168.1.50/stream1
+# Local USB / V4L2 camera (default: /dev/video0)
+./run.sh
+
+# Specific local device
+./run.sh /dev/video2
+
+# RTSP network camera
+CAMERA_DEVICE=rtsp://admin:password@192.168.1.50/stream1 ./run.sh
+
+# HTTP/MJPEG stream
+CAMERA_DEVICE=http://192.168.1.60/video ./run.sh
 ```
 
 Open a browser on any device on the same network:
@@ -70,7 +81,13 @@ http://<jetson-ip>:8080
 
 ```bash
 pip install podman-compose          # once
-export RTSP_URL=rtsp://admin:password@192.168.1.50/stream1
+
+# Local camera
+export CAMERA_DEVICE=/dev/video0
+podman-compose up -d --build
+
+# RTSP network camera
+export CAMERA_DEVICE=rtsp://admin:password@192.168.1.50/stream1
 podman-compose up -d --build
 ```
 
@@ -82,20 +99,30 @@ All options are passed as environment variables (or edited in `docker-compose.ym
 
 | Variable | Default | Description |
 |---|---|---|
-| `RTSP_URL` | *(required)* | Full RTSP URL including credentials |
+| `CAMERA_DEVICE` | `/dev/video0` | Video source — a local V4L2 device (e.g. `/dev/video0`) **or** a URL (`rtsp://`, `rtsps://`, `rtmp://`, `http://`, `https://`) |
+| `CAMERA_WIDTH` | `640` | Capture width in pixels (local devices only; ignored for URLs) |
+| `CAMERA_HEIGHT` | `480` | Capture height in pixels (local devices only; ignored for URLs) |
+| `CAMERA_FPS` | `30` | Capture frame rate (local devices only; ignored for URLs) |
 | `CONFIDENCE` | `0.40` | Minimum detection confidence (0–1) |
 | `MODEL_SIZE` | `n` | YOLOv8 variant: `n` nano · `s` small · `m` medium · `l` large · `x` xlarge |
 | `WEB_PORT` | `8080` | TCP port the web UI is served on |
 | `USE_TENSORRT` | `0` | Set to `1` to export and use a TensorRT engine (faster after first-run export) |
 | `MODEL_DIR` | `/models` | In-container path for model weights (map to host with a volume) |
 
-### Example – higher accuracy, TensorRT enabled
+### Examples
 
 ```bash
-export RTSP_URL=rtsp://admin:pass@192.168.1.50/ch0
+# Local webcam, higher accuracy, TensorRT enabled
+export CAMERA_DEVICE=/dev/video0
 export MODEL_SIZE=s
 export CONFIDENCE=0.50
 export USE_TENSORRT=1
+./run.sh
+
+# RTSP IP camera
+export CAMERA_DEVICE=rtsp://admin:pass@192.168.1.50/ch0
+export MODEL_SIZE=s
+export CONFIDENCE=0.50
 ./run.sh
 ```
 
@@ -164,7 +191,8 @@ podman exec -it rtsp-detector python3 -c \
 
 | Symptom | Fix |
 |---|---|
-| `Cannot open RTSP stream` | Verify `RTSP_URL` is reachable from the Jetson: `ffplay <url>` |
+| `Cannot open network camera: <url>` | Verify the URL is reachable from the Jetson: `ffplay <url>` — check credentials and network connectivity |
+| `Cannot open USB camera: /dev/videoN` | Confirm the device node exists (`ls /dev/video*`) and is passed to the container via `--device` |
 | `GStreamer pipeline failed; falling back to FFMPEG` | `nvv4l2decoder` not available in container – image may not match your JetPack; check base image tag |
 | Browser shows grey "Connecting…" | Container is still loading the model (~30 s on first run); wait and refresh |
 | Low FPS with large model | Use a smaller `MODEL_SIZE` (e.g. `n` or `s`), or enable `USE_TENSORRT=1` |

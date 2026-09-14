@@ -293,9 +293,10 @@ class RtspPublisher:
 
 class Detector:
     """
-    Background thread that reads from a USB camera, runs YOLOv8,
-    pushes annotated frames to the RTSP server, and keeps a JPEG buffer
-    for the Flask MJPEG preview endpoint.
+    Background thread that reads from a video source (a local V4L2 device
+    such as ``/dev/video0``, or a URL — ``rtsp://``, ``rtsps://``, ``rtmp://``,
+    ``http://``, ``https://``), runs YOLOv8, pushes annotated frames to the
+    RTSP output server, and keeps a JPEG buffer for the Flask MJPEG preview.
     """
 
     def __init__(

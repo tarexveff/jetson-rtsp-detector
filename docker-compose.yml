@@ -1,7 +1,14 @@
 # docker-compose.yml (also works with podman-compose)
 #
+# CAMERA_DEVICE can be a local V4L2 device OR a URL:
+#
 # Usage:
+#   # Local USB / V4L2 camera
 #   export CAMERA_DEVICE=/dev/video0
+#   podman-compose up -d --build
+#
+#   # RTSP network camera (no --device flag needed)
+#   export CAMERA_DEVICE=rtsp://user:pass@192.168.1.50/stream1
 #   podman-compose up -d --build
 #
 # Or set variables in a .env file next to this file.
@@ -32,8 +39,10 @@ services:
     # container the same device access as the host, which is required for CUDA.
     privileged: true
 
+    # Pass the device node to the container only for local V4L2 devices.
+    # When CAMERA_DEVICE is a URL (rtsp://, http://, etc.) this entry is ignored
+    # at runtime by the container runtime (the path won't exist on the host).
     devices:
-      # USB camera – change to match your device node
       - "${CAMERA_DEVICE:-/dev/video0}"
 
     # ── network ──────────────────────────────────────────────────────────────
@@ -48,10 +57,12 @@ services:
 
     # ── environment ──────────────────────────────────────────────────────────
     environment:
-      # Input: USB camera
+      # Input source: a local V4L2 device (e.g. /dev/video0) OR a URL
+      # (rtsp://, rtsps://, rtmp://, http://, https://)
+      # CAMERA_WIDTH / HEIGHT / FPS are used only for local devices.
       CAMERA_DEVICE:  "${CAMERA_DEVICE:-/dev/video0}"
-      CAMERA_WIDTH:   "${CAMERA_WIDTH:-1280}"
-      CAMERA_HEIGHT:  "${CAMERA_HEIGHT:-720}"
+      CAMERA_WIDTH:   "${CAMERA_WIDTH:-640}"
+      CAMERA_HEIGHT:  "${CAMERA_HEIGHT:-480}"
       CAMERA_FPS:     "${CAMERA_FPS:-30}"
 
       # Detection tuning
