@@ -419,64 +419,44 @@ class Detector:
 
     def _open_capture(self) -> cv2.VideoCapture:
         """
-        Open the USB camera.  Tries three methods in order:
-          1. GStreamer v4l2src with explicit caps (best, zero-copy on Jetson)
-          2. GStreamer v4l2src without forcing caps (lets camera negotiate)
-          3. OpenCV V4L2 backend directly with the device path string
+        Open the video source.  Supports two modes:
+
+        Network source (CAMERA_DEVICE starts with rtsp://, http://, https://):
+          Opens with cv2.CAP_FFMPEG — works for RTSP, MJPEG-over-HTTP, and
+          ONVIF/RTSP IP cameras.
+
+        USB/local device (/dev/videoN or integer index):
+          Opens with cv2.CAP_V4L2.
         """
         dev = self.camera_device
         w   = self.camera_width
         h   = self.camera_height
         fps = self.camera_fps
 
-        # ── attempt 1: GStreamer with explicit resolution/framerate caps ────────
-        # timeout=5000000000 (5 s in ns) makes the source return an error buffer
-        # instead of blocking indefinitely if the camera stalls.
-        gst_explicit = (
-            f"v4l2src device={dev} do-timestamp=true "
-            f"! video/x-raw,width={w},height={h},framerate={fps}/1 "
-            f"! videoconvert "
-            f"! video/x-raw,format=BGR "
-            f"! appsink drop=true sync=false max-buffers=2"
-        )
-        cap = cv2.VideoCapture(gst_explicit, cv2.CAP_GSTREAMER)
-        if cap.isOpened():
-            logger.info("Opened %s via GStreamer (explicit caps).", dev)
-            return cap
-        cap.release()
-        logger.warning("GStreamer explicit-caps pipeline failed for %s.", dev)
+        is_network = dev.startswith(("rtsp://", "rtsps://", "http://", "https://", "rtmp://"))
 
-        # ── attempt 2: GStreamer letting the camera negotiate its own caps ───────
-        gst_auto = (
-            f"v4l2src device={dev} do-timestamp=true "
-            f"! videoconvert "
-            f"! video/x-raw,format=BGR "
-            f"! appsink drop=true sync=false max-buffers=2"
-        )
-        cap = cv2.VideoCapture(gst_auto, cv2.CAP_GSTREAMER)
-        if cap.isOpened():
-            logger.info("Opened %s via GStreamer (auto caps).", dev)
-            # Apply desired resolution/fps as hints (best-effort)
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH,  w)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
-            cap.set(cv2.CAP_PROP_FPS,          fps)
+        if is_network:
+            # ── IP / network camera ──────────────────────────────────────────
+            # CAP_PROP_BUFFERSIZE=1 minimises latency by discarding queued frames.
+            cap = cv2.VideoCapture(dev, cv2.CAP_FFMPEG)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            if not cap.isOpened():
+                raise RuntimeError(
+                    f"Cannot open network camera: {dev}\n"
+                    f"  Check the URL, credentials, and network connectivity."
+                )
+            logger.info("Opened network source %s via FFMPEG.", dev)
             return cap
-        cap.release()
-        logger.warning("GStreamer auto-caps pipeline failed for %s.", dev)
 
-        # ── attempt 3: plain OpenCV V4L2 backend using the device path ──────────
-        # Pass the path string directly — OpenCV accepts both "/dev/videoN"
-        # strings and integer indices on Linux.
+        # ── USB / local V4L2 device ──────────────────────────────────────────
         cap = cv2.VideoCapture(dev, cv2.CAP_V4L2)
         if not cap.isOpened():
-            # Last resort: derive integer index and try that
             try:
                 idx = int(dev.replace("/dev/video", "")) if "/dev/video" in dev else int(dev)
             except ValueError:
                 idx = 0
             cap = cv2.VideoCapture(idx, cv2.CAP_V4L2)
-        # Limit the internal V4L2 buffer to 2 frames so cap.read() returns
-        # quickly instead of draining a deep queue of stale frames.
+
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)
 
         if not cap.isOpened():
@@ -489,7 +469,7 @@ class Detector:
         cap.set(cv2.CAP_PROP_FRAME_WIDTH,  w)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
         cap.set(cv2.CAP_PROP_FPS,          fps)
-        logger.info("Opened %s via OpenCV V4L2 backend.", dev)
+        logger.info("Opened %s via V4L2.", dev)
         return cap
 
     def _loop(self) -> None:

@@ -138,6 +138,7 @@ podman run \
   --env RTSP_OUT_PATH="${RTSP_OUT_PATH}" \
   --env USE_TENSORRT="${USE_TENSORRT}" \
   --env LD_LIBRARY_PATH="/usr/lib/aarch64-linux-gnu/tegra:/usr/lib64/nvidia:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}" \
+  --env GST_DEBUG="${GST_DEBUG:-1}" \
   \
   "${IMAGE_NAME}:latest"
 
@@ -150,6 +151,10 @@ echo "              Or:         vlc    rtsp://${HOST_IP}:${RTSP_OUT_PORT}${RTSP_
 echo ""
 echo "  Web preview : http://${HOST_IP}:${WEB_PORT}"
 echo ""
-echo "  Logs:    podman logs -f ${CONTAINER_NAME}"
 echo "  Stop:    podman stop ${CONTAINER_NAME}"
 echo "  Remove:  podman rm ${CONTAINER_NAME}"
+echo ""
+echo "► Tailing logs (Ctrl-C to stop following, container keeps running):"
+echo "  To increase GStreamer verbosity: GST_DEBUG=3 ./run.sh"
+echo ""
+podman logs -f "${CONTAINER_NAME}"
