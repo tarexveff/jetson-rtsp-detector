@@ -38,6 +38,7 @@ services:
     # nodes is unreliable across JetPack versions.  privileged gives the
     # container the same device access as the host, which is required for CUDA.
     privileged: true
+    user: root
 
     # Pass the device node to the container only for local V4L2 devices.
     # When CAMERA_DEVICE is a URL (rtsp://, http://, etc.) this entry is ignored
@@ -51,9 +52,13 @@ services:
     # ── shared memory ────────────────────────────────────────────────────────
     shm_size: "512m"
 
-    # ── model weight cache ───────────────────────────────────────────────────
+    # ── CUDA / Jetson library bind-mounts (RHEL/aarch64) ─────────────────────
+    # On this RHEL Jetson host libcuda.so lives in /usr/lib64/nvidia and /lib64.
+    # Mount only the nvidia directory — do NOT mount /lib64 wholesale as it
+    # would overwrite the container's glibc with the host's older version.
     volumes:
       - ./models:/models:z
+      - /usr/lib64/nvidia:/usr/lib64/nvidia:ro
 
     # ── environment ──────────────────────────────────────────────────────────
     environment:
@@ -76,3 +81,9 @@ services:
 
       # Web preview
       WEB_PORT:       "${WEB_PORT:-8080}"
+
+      # GStreamer verbosity (set GST_DEBUG=3 in your shell for more detail)
+      GST_DEBUG:      "${GST_DEBUG:-1}"
+
+      # Make the bind-mounted host CUDA libs findable by the dynamic linker
+      LD_LIBRARY_PATH: "/usr/lib64/nvidia:"
