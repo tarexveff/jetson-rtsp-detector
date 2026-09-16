@@ -1,20 +1,25 @@
 # docker-compose.yml (also works with podman-compose)
 #
-# CAMERA_DEVICE can be a local V4L2 device OR a URL:
+# CAMERA_DEVICE can be a local V4L2 device OR an RTSP/HTTP URL:
 #
 # Usage:
 #   # Local USB / V4L2 camera
 #   export CAMERA_DEVICE=/dev/video0
-#   podman-compose up -d --build
+#   docker compose up -d --build
 #
-#   # RTSP network camera (no --device flag needed)
+#   # RTSP network camera
 #   export CAMERA_DEVICE=rtsp://user:pass@192.168.1.50/stream1
-#   podman-compose up -d --build
+#   docker compose up -d --build
 #
-# Or set variables in a .env file next to this file.
+# Or create a .env file next to this file:
+#   CAMERA_DEVICE=rtsp://user:pass@192.168.1.50/stream1
 #
-# Requires:  podman-compose  (pip install podman-compose)
-#            OR  docker compose  (works identically)
+# Note: the container runs privileged (required for Jetson GPU/CUDA access),
+# which already grants access to all host device nodes including /dev/video*.
+# A separate `devices:` entry is therefore not needed and is omitted so that
+# RTSP URLs can be passed without Docker/Podman rejecting a non-existent path.
+#
+# Requires:  docker compose  (v2)  OR  podman-compose  (pip install podman-compose)
 
 version: "3.9"
 
@@ -39,12 +44,6 @@ services:
     # container the same device access as the host, which is required for CUDA.
     privileged: true
     user: root
-
-    # Pass the device node to the container only for local V4L2 devices.
-    # When CAMERA_DEVICE is a URL (rtsp://, http://, etc.) this entry is ignored
-    # at runtime by the container runtime (the path won't exist on the host).
-    devices:
-      - "${CAMERA_DEVICE:-/dev/video0}"
 
     # ── network ──────────────────────────────────────────────────────────────
     network_mode: host
