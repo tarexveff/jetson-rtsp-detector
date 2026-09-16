@@ -21,7 +21,7 @@ RTSP/HTTP URL  ─┐
 |---|---|
 | Jetson Orin Nano | JetPack 6.x (CUDA 12.2) or JetPack 5.1.x (CUDA 11.4) |
 | Podman | ≥ 4.x |
-| Host OS | Ubuntu 22.04 (L4T) |
+| Host OS | Ubuntu 22.04 (L4T) **or** RHEL / RHEL-compatible (aarch64) |
 
 > **JetPack 5 users** – change the `FROM` line in [`Dockerfile`](Dockerfile) to  
 > `FROM nvcr.io/nvidia/l4t-pytorch:r35.4.1-pth2.1-py3`
@@ -143,12 +143,30 @@ The viewer page auto-reconnects if the stream is interrupted and includes a one-
 
 ## GPU passthrough details
 
-The container uses Podman's `--device` flags to expose every Jetson device node needed for:
+The container runs with `privileged: true`, which grants access to all host device nodes. This is the most reliable approach on Jetson because the SoC GPU device tree varies across JetPack versions and across Ubuntu and RHEL host configurations — passing individual `--device` flags is fragile by comparison.
 
-- **CUDA compute** – `nvidia0`, `nvidiactl`, `nvidia-uvm`  
+Device nodes exposed to the container include:
+
+- **CUDA compute** – `nvidia0`, `nvidiactl`, `nvidia-uvm`
 - **Hardware video decode** – `nvhost-ctrl`, `nvhost-ctrl-gpu`, `nvhost-as-gpu`, `nvhost-vic`, `nvhost-nvdla0/1`, `nvmap`
 
 The GStreamer pipeline inside the container uses `nvv4l2decoder` for zero-copy H.264 hardware decoding, keeping CPU usage low and latency minimal.
+
+---
+
+## RHEL support
+
+The project runs on RHEL (and RHEL-compatible) hosts on the Jetson in addition to Ubuntu L4T.
+
+**Key differences on RHEL:**
+
+- **CUDA library path** — On RHEL aarch64 Jetson hosts the NVIDIA CUDA libraries are installed under `/usr/lib64/nvidia` rather than the Ubuntu default of `/usr/lib/aarch64-linux-gnu`.  The [`docker-compose.yml`](docker-compose.yml) bind-mounts `/usr/lib64/nvidia` into the container read-only and sets `LD_LIBRARY_PATH=/usr/lib64/nvidia` so the container finds them automatically.  If your RHEL host installs them to a different path, update the `volumes:` entry and `LD_LIBRARY_PATH` value in [`docker-compose.yml`](docker-compose.yml) to match.
+
+- **SELinux** — The `:z` flag on the `./models` volume mount in [`docker-compose.yml`](docker-compose.yml) relabels the directory for shared container access, which is required when SELinux is enforcing.
+
+- **Podman vs Docker** — RHEL ships Podman by default; `podman-compose` or `docker compose` (via the Docker CE repo) both work.  All commands in this README that use `podman` are interchangeable with `docker`.
+
+- **Container runtime** — No NVIDIA container toolkit is required.  `privileged: true` is sufficient to expose the Jetson's integrated GPU to the container on both Ubuntu and RHEL hosts.
 
 ---
 
